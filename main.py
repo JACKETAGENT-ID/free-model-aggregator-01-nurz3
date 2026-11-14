@@ -991,40 +991,90 @@ def _openai_chunk(model, delta, finish=None, usage=None):
     if usage is not None: chunk["usage"] = usage
     return "data: %s\n\n" % compact_json(chunk)
 def openai_sse_to_anthropic(text, model):
-    chunks, input_tokens, output_tokens, pending_stop = [], 0, 0, None
+    # Rebuild an OpenAI SSE stream as an Anthropic event stream: one
+    # text block plus one tool_use block per upstream tool index.
+    deltas = []
+    input_tokens = 0
+    output_tokens = 0
+    pending_stop = None
     for _event, payload in _parse_sse_frames(text):
-        if payload.strip() == "[DONE]": continue
-        try: chunk = json.loads(payload)
-        except Exception: continue
-        if not _is_record(chunk): continue
+        if payload.strip() == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(payload)
+        except Exception:
+            continue
+        if not _is_record(chunk):
+            continue
         if _is_record(chunk.get("usage")):
-            input_tokens = _number_or_zero(chunk["usage"].get("prompt_tokens")); output_tokens = _number_or_zero(chunk["usage"].get("completion_tokens"))
+            input_tokens = _number_or_zero(chunk["usage"].get("prompt_tokens"))
+            output_tokens = _number_or_zero(chunk["usage"].get("completion_tokens"))
         choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
-        if not choices or not _is_record(choices[0]): continue
-        chunks.append(choices[0].get("delta") if _is_record(choices[0].get("delta")) else {})
-        if choices[0].get("finish_reason") is not None: pending_stop = stop_reason_of(choices[0].get("finish_reason"))
+        if not choices or not _is_record(choices[0]):
+            continue
+        first = choices[0]
+        deltas.append(first.get("delta") if _is_record(first.get("delta")) else {})
+        if first.get("finish_reason") is not None:
+            pending_stop = stop_reason_of(first.get("finish_reason"))
     events = [_anthropic_msg_start(model, input_tokens)]
-    text_index, next_index, tool_indexes = -1, 0, {}
-    for delta in chunks:
+    text_index = -1
+    next_index = 0
+    tool_indexes = {}
+
+    def close_text_block():
+        nonlocal text_index
+        if text_index != -1:
+            events.append(_sse_event("content_block_stop", {"type": "content_block_stop", "index": text_index}))
+            text_index = -1
+
+    for delta in deltas:
         content = delta.get("content")
         if isinstance(content, str) and content != "":
             if text_index == -1:
-                text_index = next_index; next_index += 1
-                events.append(_sse_event("content_block_start", {"type": "content_block_start", "index": text_index, "content_block": {"type": "text", "text": ""}}))
-            events.append(_sse_event("content_block_delta", {"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": content}}))
-        for call in delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else []:
-            if not _is_record(call): continue
+                text_index = next_index
+                next_index += 1
+                events.append(_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": text_index,
+                    "content_block": {"type": "text", "text": ""},
+                }))
+            events.append(_sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": text_index,
+                "delta": {"type": "text_delta", "text": content},
+            }))
+        calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else []
+        for call in calls:
+            if not _is_record(call):
+                continue
             upstream_index = call.get("index") if isinstance(call.get("index"), int) else len(tool_indexes)
             index = tool_indexes.get(upstream_index)
-            if index is None:
-                if text_index != -1: events.append(_sse_event("content_block_stop", {"type": "content_block_stop", "index": text_index})); text_index = -1
-                index = next_index; next_index += 1; tool_indexes[upstream_index] = index
-                fn = call.get("function") if _is_record(call.get("function")) else {}
-                events.append(_sse_event("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": call.get("id") if isinstance(call.get("id"), str) and call.get("id") != "" else "toolu_%d" % index, "name": fn.get("name") if isinstance(fn.get("name"), str) else "", "input": {}}}))
             fn = call.get("function") if _is_record(call.get("function")) else {}
-            if isinstance(fn.get("arguments"), str) and fn["arguments"] != "": events.append(_sse_event("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}))
-    if text_index != -1: events.append(_sse_event("content_block_stop", {"type": "content_block_stop", "index": text_index}))
-    for index in sorted(tool_indexes.values()): events.append(_sse_event("content_block_stop", {"type": "content_block_stop", "index": index}))
+            if index is None:
+                close_text_block()
+                index = next_index
+                next_index += 1
+                tool_indexes[upstream_index] = index
+                call_id = call.get("id")
+                events.append(_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": call_id if isinstance(call_id, str) and call_id != "" else "toolu_%d" % index,
+                        "name": fn.get("name") if isinstance(fn.get("name"), str) else "",
+                        "input": {},
+                    },
+                }))
+            if isinstance(fn.get("arguments"), str) and fn["arguments"] != "":
+                events.append(_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]},
+                }))
+    close_text_block()
+    for index in sorted(tool_indexes.values()):
+        events.append(_sse_event("content_block_stop", {"type": "content_block_stop", "index": index}))
     events.append(_anthropic_msg_end(pending_stop or "end_turn", output_tokens))
     return "".join(events)
 def anthropic_json_to_openai(body, model):
@@ -1039,37 +1089,72 @@ def anthropic_json_to_openai(body, model):
     input_tokens, output_tokens = _number_or_zero(usage.get("input_tokens")), _number_or_zero(usage.get("output_tokens"))
     return {"id": "chatcmpl_%s" % (body.get("id") if isinstance(body.get("id"), str) else "sim"), "object": "chat.completion", "created": FIXED_CREATED, "model": model, "choices": [{"index": 0, "message": message, "finish_reason": openai_finish_of(body.get("stop_reason")), "logprobs": None}], "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens, "total_tokens": input_tokens + output_tokens}}
 def anthropic_sse_to_openai(text, model):
-    input_tokens, output_tokens, stop_reason = 0, 0, None
-    text_parts, tool_blocks = [], {}
+    # Rebuild an Anthropic event stream as OpenAI chunks: the text is
+    # replayed in fixed-size slices, then one chunk pair per tool
+    # block (header, then its accumulated arguments).
+    input_tokens = 0
+    output_tokens = 0
+    stop_reason = None
+    text_parts = []
+    tool_blocks = {}
     for event, payload in _parse_sse_frames(text):
-        try: data = json.loads(payload)
-        except Exception: continue
-        if not _is_record(data): continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if not _is_record(data):
+            continue
         if event == "message_start":
             message = data.get("message") if _is_record(data.get("message")) else {}
             usage = message.get("usage") if _is_record(message.get("usage")) else {}
             input_tokens = _number_or_zero(usage.get("input_tokens"))
         elif event == "content_block_start":
-            index = data.get("index"); block = data.get("content_block") if _is_record(data.get("content_block")) else {}
-            if isinstance(index, int) and block.get("type") == "tool_use": tool_blocks[index] = {"id": block.get("id") if isinstance(block.get("id"), str) else "", "name": block.get("name") if isinstance(block.get("name"), str) else "", "args": ""}
+            index = data.get("index")
+            block = data.get("content_block") if _is_record(data.get("content_block")) else {}
+            if isinstance(index, int) and block.get("type") == "tool_use":
+                tool_blocks[index] = {
+                    "id": block.get("id") if isinstance(block.get("id"), str) else "",
+                    "name": block.get("name") if isinstance(block.get("name"), str) else "",
+                    "args": "",
+                }
         elif event == "content_block_delta":
-            index = data.get("index"); delta = data.get("delta") if _is_record(data.get("delta")) else {}
-            if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str): text_parts.append(delta["text"])
-            elif delta.get("type") == "input_json_delta" and isinstance(index, int) and index in tool_blocks and isinstance(delta.get("partial_json"), str): tool_blocks[index]["args"] += delta["partial_json"]
+            index = data.get("index")
+            delta = data.get("delta") if _is_record(data.get("delta")) else {}
+            if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                text_parts.append(delta["text"])
+            elif (delta.get("type") == "input_json_delta" and isinstance(index, int)
+                    and index in tool_blocks and isinstance(delta.get("partial_json"), str)):
+                tool_blocks[index]["args"] += delta["partial_json"]
         elif event == "message_delta":
             delta = data.get("delta") if _is_record(data.get("delta")) else {}
-            if isinstance(delta.get("stop_reason"), str): stop_reason = delta["stop_reason"]
+            if isinstance(delta.get("stop_reason"), str):
+                stop_reason = delta["stop_reason"]
             usage = data.get("usage") if _is_record(data.get("usage")) else {}
             output_tokens = _number_or_zero(usage.get("output_tokens"))
     frames = [_openai_chunk(model, {"role": "assistant", "content": ""})]
     full_text = "".join(text_parts)
-    for at in range(0, len(full_text), SSE_TEXT_CHUNK_CHARS): frames.append(_openai_chunk(model, {"content": full_text[at:at + SSE_TEXT_CHUNK_CHARS]}))
+    for at in range(0, len(full_text), SSE_TEXT_CHUNK_CHARS):
+        frames.append(_openai_chunk(model, {"content": full_text[at:at + SSE_TEXT_CHUNK_CHARS]}))
     for order, index in enumerate(sorted(tool_blocks)):
         block = tool_blocks[index]
-        frames.append(_openai_chunk(model, {"tool_calls": [{"index": order, "id": block["id"], "type": "function", "function": {"name": block["name"], "arguments": ""}}]}))
-        if block["args"] != "": frames.append(_openai_chunk(model, {"tool_calls": [{"index": order, "function": {"arguments": block["args"]}}]}))
+        frames.append(_openai_chunk(model, {
+            "tool_calls": [{
+                "index": order,
+                "id": block["id"],
+                "type": "function",
+                "function": {"name": block["name"], "arguments": ""},
+            }]
+        }))
+        if block["args"] != "":
+            frames.append(_openai_chunk(model, {
+                "tool_calls": [{"index": order, "function": {"arguments": block["args"]}}]
+            }))
     frames.append(_openai_chunk(model, {}, finish=openai_finish_of(stop_reason)))
-    frames.append(_openai_chunk(model, {}, usage={"prompt_tokens": input_tokens, "completion_tokens": output_tokens, "total_tokens": input_tokens + output_tokens}))
+    frames.append(_openai_chunk(model, {}, usage={
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }))
     frames.append("data: [DONE]\n\n")
     return "".join(frames)
 def _gemini_text(body):
